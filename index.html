@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>64×64 Drum Sequencer</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+    body {
+      margin: 0;
+      padding: 12px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    .main-container {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .grid-container {
+      width: 640px;
+      height: 640px;
+      border: 1px solid #ccc;
+      position: relative;
+      user-select: none;
+      flex-shrink: 0;
+    }
+    /* Grid uses gap for seamless appearance (no borders between cells) */
+    .grid {
+      display: grid;
+      gap: 1px;
+      width: 100%;
+      height: 100%;
+      background: #ddd;
+    }
+    .cell {
+      background: #fff;
+      cursor: pointer;
+    }
+    .cell.on {
+      background: #000;
+    }
+    /* Playhead visualization - yellow outline on current column */
+    .cell.playhead {
+      outline: 2px solid rgba(255, 200, 0, 0.9);
+      outline-offset: -1px;
+    }
+    /* Per-row triggering indicator - flash when note sounds */
+    .cell.triggered {
+      box-shadow: inset 0 0 12px rgba(255, 200, 0, 0.7);
+    }
+    /* Selection frame overlay - only outer borders */
+    .selection-frame {
+      position: absolute;
+      border: 3px solid rgba(0, 120, 255, 0.9);
+      pointer-events: none;
+      z-index: 10;
+      display: none;
+    }
+    .controls {
+      flex: 1;
+      min-width: 320px;
+    }
+    .voice-panel {
+      border: 1px solid #eee;
+      padding: 8px;
+      margin-bottom: 8px;
+      transition: background 0.1s ease;
+    }
+    /* Voice highlighting when triggered */
+    .voice-panel.triggered {
+      background: rgba(255, 200, 0, 0.2);
+    }
+    button {
+      padding: 6px 12px;
+      cursor: pointer;
+    }
+    input[type="number"], select {
+      padding: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h2>64×64 Drum Sequencer</h2>
+  <div class="main-container">
+    <div class="grid-container" id="gridContainer">
+      <div class="grid" id="grid"></div>
+      <div class="selection-frame" id="selectionFrame"></div>
+    </div>
+    <div class="controls">
+      <div style="margin-bottom: 12px;">
+        <label>BPM: <input type="number" id="bpmInput" value="120" min="30" max="300" style="width: 70px;" /></label>
+        <button id="playBtn">Play</button>
+        <button id="randomBtn">Randomize</button>
+        <div style="margin-top: 6px; font-size: 14px;">Step: <span id="currentStep">0</span></div>
+      </div>
+      <div style="margin-bottom: 12px;">
+        <label>Mode: 
+          <select id="modeSelect">
+            <option value="sample">Sample</option>
+            <option value="midi">MIDI</option>
+          </select>
+        </label>
+      </div>
+      <div id="midiControls" style="display: none; margin-bottom: 12px;">
+        <label>MIDI Channel: <input type="number" id="midiChannel" min="1" max="16" value="1" style="width: 50px;" /></label>
+        <div style="margin-top: 6px;">
+          <label>Output: <select id="midiOutput"></select></label>
+        </div>
+      </div>
+      <h4 style="margin-top: 14px; margin-bottom: 8px;">Voices</h4>
+      <div id="voicesContainer"></div>
+      <div style="margin-top: 12px; font-size: 13px; color: #666;">
+        <strong>Tips:</strong> Click cells to toggle notes. Click+drag horizontally to set selection length (always 4 rows tall). 
+        Shift+click to move selection. The yellow playhead shows the current step.
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ========== Sequencer Engine ==========
+    class SequencerEngine {
+      constructor(opts = {}) {
+        this.mode = opts.mode || 'sample';
+        this.numRows = opts.numRows || 4;
+        this.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        this.defaultNoteLength = 0.3;
+        
+        this.sampleBuffers = new Array(this.numRows).fill(null);
+        this.muted = new Array(this.numRows).fill(false);
+        this.volumes = new Array(this.numRows).fill(1.0);
+        this.midiNotes = [36, 38, 42, 46];
+        
+        this.midiAccess = null;
+        this.midiOutput = null;
+        this.midiChannel = 1;
+        
+        // Request MIDI access
+        if (navigator.requestMIDIAccess) {
+          navigator.requestMIDIAccess().then(m => {
+            this.midiAccess = m;
+          }).catch(() => {});
+        }
+        
+        // Resume audio context on user gesture
+        const resume = () => {
+          if (this.audioCtx.state === 'suspended') {
+            this.audioCtx.resume();
+          }
+        };
+        document.addEventListener('click', resume, { once: true });
+        document.addEventListener('keydown', resume, { once: true });
+      }
+      
+      setMode(m) { this.mode = m; }
+      setMidiOutput(output) { this.midiOutput = output; }
+      setMidiChannel(ch) { this.midiChannel = Math.max(1, Math.min(16, ch)); }
+      
+      loadSample(rowIndex, audioBuffer) {
+        if (rowIndex >= 0 && rowIndex < this.numRows) {
+          this.sampleBuffers[rowIndex] = audioBuffer;
+        }
+      }
+      
+      setVolume(rowIndex, v) {
+        if (rowIndex >= 0 && rowIndex < this.numRows) {
+          this.volumes[rowIndex] = Math.max(0, Math.min(1, v));
+        }
+      }
+      
+      setMute(rowIndex, m) {
+        if (rowIndex >= 0 && rowIndex < this.numRows) {
+          this.muted[rowIndex] = !!m;
+        }
+      }
+      
+      async triggerRow(rowIndex, when, velocity = 127) {
+        if (rowIndex < 0 || rowIndex >= this.numRows || this.muted[rowIndex]) return;
+        
+        const playTime = when || this.audioCtx.currentTime;
+        
+        if (this.audioCtx.state === 'suspended') {
+          await this.audioCtx.resume();
+        }
+        
+        if (this.mode === 'sample') {
+          this._playSample(rowIndex, playTime, velocity);
+        } else {
+          this._playMidiNote(rowIndex, playTime, velocity);
+        }
+      }
+      
+      _playSample(rowIndex, time, velocity) {
+        const buffer = this.sampleBuffers[rowIndex];
+        if (!buffer) {
+          this._playOscillator(rowIndex, time, velocity);
+          return;
+        }
+        
+        const source = this.audioCtx.createBufferSource();
+        source.buffer = buffer;
+        
+        const gain = this.audioCtx.createGain();
+        const velFactor = velocity / 127;
+        const targetGain = this.volumes[rowIndex] * velFactor;
+        
+        gain.gain.setValueAtTime(targetGain, time);
+        const fadeStart = time + this.defaultNoteLength * 0.6;
+        gain.gain.setValueAtTime(targetGain, fadeStart);
+        gain.gain.linearRampToValueAtTime(0.0001, fadeStart + this.defaultNoteLength * 0.4);
+        
+        source.connect(gain);
+        gain.connect(this.audioCtx.destination);
+        source.start(time);
+        const stopTime = Math.min(time + buffer.duration, fadeStart + this.defaultNoteLength * 0.4 + 0.05);
+        source.stop(stopTime);
+      }
+      
+      _playMidiNote(rowIndex, time, velocity) {
+        const noteNumber = this.midiNotes[rowIndex];
+        const chan = (this.midiChannel - 1) & 0xF;
+        const statusOn = 0x90 | chan;
+        const statusOff = 0x80 | chan;
+        
+        if (this.midiOutput && typeof this.midiOutput.send === 'function') {
+          const now = performance.now();
+          const audioNow = this.audioCtx.currentTime;
+          const perfToAudio = now / 1000 - audioNow;
+          const noteOnTime = (time + perfToAudio) * 1000;
+          const noteOffTime = (time + this.defaultNoteLength + perfToAudio) * 1000;
+          
+          try {
+            this.midiOutput.send([statusOn, noteNumber, velocity], noteOnTime);
+            this.midiOutput.send([statusOff, noteNumber, 0], noteOffTime);
+          } catch(e) {
+            this.midiOutput.send([statusOn, noteNumber, velocity]);
+            setTimeout(() => {
+              this.midiOutput.send([statusOff, noteNumber, 0]);
+            }, this.defaultNoteLength * 1000);
+          }
+        } else {
+          this._playOscillator(rowIndex, time, velocity);
+        }
+      }
+      
+      _playOscillator(rowIndex, time, velocity) {
+        const osc = this.audioCtx.createOscillator();
+        const gain = this.audioCtx.createGain();
+        
+        const midiNote = this.midiNotes[rowIndex];
+        const freq = 440 * Math.pow(2, (midiNote - 69) / 12);
+        osc.frequency.setValueAtTime(freq, time);
+        osc.type = 'sine';
+        
+        const velFactor = velocity / 127;
+        const initGain = this.volumes[rowIndex] * velFactor * 0.15;
+        
+        gain.gain.setValueAtTime(0.0001, time);
+        gain.gain.linearRampToValueAtTime(initGain, time + 0.005);
+        
+        const releaseStart = time + this.defaultNoteLength * 0.6;
+        gain.gain.setValueAtTime(initGain, releaseStart);
+        gain.gain.linearRampToValueAtTime(0.0001, releaseStart + this.defaultNoteLength * 0.4);
+        
+        osc.connect(gain);
+        gain.connect(this.audioCtx.destination);
+        osc.start(time);
+        osc.stop(releaseStart + this.defaultNoteLength * 0.4 + 0.05);
+      }
+    }
+
+    // ========== Main Sequencer App ==========
+    class DrumSequencer {
+      constructor() {
+        this.ROWS = 64;
+        this.COLS = 64;
+        this.grid = new Uint8Array(this.ROWS * this.COLS);
+        this.selection = { active: false, startRow: 0, startCol: 0, length: 4 };
+        this.engine = new SequencerEngine({ numRows: 4 });
+        
+        this.playing = false;
+        this.bpm = 120;
+        this.currentStep = 0;
+        this.stepIntervalSec = 60 / 120 / 4;
+        
+        this.nextStepTime = 0;
+        this.currentColIndex = 0;
+        this.schedulerTimer = null;
+        
+        this.muted = [false, false, false, false];
+        this.volumes = [1, 1, 1, 1];
+        this.samplesInfo = [null, null, null, null];
+        this.triggeredRows = [false, false, false, false];
+        
+        this.mouseState = { dragging: false, startRow: 0, startCol: 0 };
+        
+        this.initUI();
+        this.initMIDI();
+      }
+      
+      initUI() {
+        // Create grid cells
+        const gridEl = document.getElementById('grid');
+        gridEl.style.gridTemplateColumns = `repeat(${this.COLS}, 1fr)`;
+        gridEl.style.gridTemplateRows = `repeat(${this.ROWS}, 1fr)`;
+        
+        for (let r = 0; r < this.ROWS; r++) {
+          for (let c = 0; c < this.COLS; c++) {
+            const cell = document.createElement('div');
+            cell.className = 'cell off';
+            cell.dataset.row = r;
+            cell.dataset.col = c;
+            gridEl.appendChild(cell);
+          }
+        }
+        
+        // Create voice panels
+        const voicesContainer = document.getElementById('voicesContainer');
+        for (let i = 0; i < 4; i++) {
+          const panel = document.createElement('div');
+          panel.className = 'voice-panel';
+          panel.id = `voice${i}`;
+          panel.innerHTML = `
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+              <strong>Voice ${i + 1}</strong>
+              <div>
+                <label style="margin-right: 8px;">
+                  <input type="checkbox" id="mute${i}"> Mute
+                </label>
+                <label>
+                  Vol <input type="range" id="vol${i}" min="0" max="1" step="0.01" value="1" style="width: 80px;">
+                </label>
+              </div>
+            </div>
+            <div>
+              <input type="file" id="file${i}" accept="audio/*" style="font-size: 12px;">
+              <div id="sampleInfo${i}" style="font-size: 11px; margin-top: 4px; color: #666;">No sample</div>
+            </div>
+          `;
+          voicesContainer.appendChild(panel);
+          
+          // Attach event listeners
+          document.getElementById(`mute${i}`).addEventListener('change', (e) => {
+            this.muted[i] = e.target.checked;
+            this.engine.setMute(i, e.target.checked);
+          });
+          
+          document.getElementById(`vol${i}`).addEventListener('input', (e) => {
+            this.volumes[i] = parseFloat(e.target.value);
+            this.engine.setVolume(i, this.volumes[i]);
+          });
+          
+          document.getElementById(`file${i}`).addEventListener('change', (e) => {
+            this.handleFileUpload(i, e.target.files[0]);
+          });
+        }
+        
+        // Grid interaction
+        const gridContainer = document.getElementById('gridContainer');
+        gridContainer.addEventListener('pointerdown', this.onPointerDown.bind(this));
+        gridContainer.addEventListener('pointermove', this.onPointerMove.bind(this));
+        gridContainer.addEventListener('pointerup', this.onPointerUp.bind(this));
+        
+        // Cell clicks
+        gridEl.addEventListener('click', (e) => {
+          if (e.target.classList.contains('cell')) {
+            const row = parseInt(e.target.dataset.row);
+            const col = parseInt(e.target.dataset.col);
+            this.onCellClick(row, col, e);
+          }
+        });
+        
+        // Controls
+        document.getElementById('playBtn').addEventListener('click', () => {
+          this.togglePlay();
+        });
+        
+        document.getElementById('randomBtn').addEventListener('click', () => {
+          this.randomize();
+        });
+        
+        document.getElementById('bpmInput').addEventListener('change', (e) => {
+          const val = parseInt(e.target.value);
+          this.bpm = Math.max(30, Math.min(300, val));
+          e.target.value = this.bpm;
+          this.stepIntervalSec = 60 / this.bpm / 4;
+        });
+        
+        document.getElementById('modeSelect').addEventListener('change', (e) => {
+          this.engine.setMode(e.target.value);
+          document.getElementById('midiControls').style.display = 
+            e.target.value === 'midi' ? 'block' : 'none';
+        });
+        
+        document.getElementById('midiChannel').addEventListener('change', (e) => {
+          this.engine.setMidiChannel(parseInt(e.target.value));
+        });
+      }
+      
+      async initMIDI() {
+        if (!navigator.requestMIDIAccess) return;
+        
+        try {
+          const access = await navigator.requestMIDIAccess();
+          const outputs = Array.from(access.outputs.values());
+          const select = document.getElementById('midiOutput');
+          
+          outputs.forEach((output, idx) => {
+            const option = document.createElement('option');
+            option.value = idx;
+            option.textContent = output.name || output.id;
+            select.appendChild(option);
+          });
+          
+          if (outputs.length > 0) {
+            this.engine.setMidiOutput(outputs[0]);
+          }
+          
+          select.addEventListener('change', (e) => {
+            const idx = parseInt(e.target.value);
+            if (outputs[idx]) {
+              this.engine.setMidiOutput(outputs[idx]);
+            }
+          });
+        } catch(e) {
+          console.log('MIDI not available');
+        }
+      }
+      
+      async handleFileUpload(voiceIdx, file) {
+        if (!file) return;
+        
+        try {
+          const arrayBuffer = await file.arrayBuffer();
+          const audioBuffer = await this.engine.audioCtx.decodeAudioData(arrayBuffer);
+          this.engine.loadSample(voiceIdx, audioBuffer);
+          
+          this.samplesInfo[voiceIdx] = {
+            name: file.name,
+            duration: Math.round(audioBuffer.duration * 1000)
+          };
+          
+          document.getElementById(`sampleInfo${voiceIdx}`).textContent = 
+            `${file.name} (${this.samplesInfo[voiceIdx].duration}ms)`;
+        } catch(e) {
+          console.error('Error loading sample:', e);
+        }
+      }
+      
+      onPointerDown(e) {
+        const rect = e.currentTarget.getBoundingClientRect();
+        const cellW = rect.width / this.COLS;
+        const cellH = rect.height / this.ROWS;
+        const col = Math.floor((e.clientX - rect.left) / cellW);
+        const row = Math.floor((e.clientY - rect.top) / cellH);
+        
+        this.mouseState = { dragging: true, startRow: row, startCol: col };
+        
+        const startRowFixed = Math.max(0, Math.min(this.ROWS - 4, row));
+        this.selection = { active: true, startRow: startRowFixed, startCol: col, length: 4 };
+        this.updateSelectionFrame();
+      }
+      
+      onPointerMove(e) {
+        if (!this.mouseState.dragging) return;
+        
+        const rect = e.currentTarget.getBoundingClientRect();
+        const cellW = rect.width / this.COLS;
+        const col = Math.floor((e.clientX - rect.left) / cellW);
+        
+        const startCol = this.mouseState.startCol;
+        const len = Math.max(1, Math.abs(col - startCol) + 1);
+        const startColFinal = Math.min(startCol, col);
+        
+        this.selection.startCol = startColFinal;
+        this.selection.length = len;
+        this.updateSelectionFrame();
+      }
+      
+      onPointerUp(e) {
+        this.mouseState.dragging = false;
+        if (this.selection.length <= 1) {
+          this.selection.length = 4;
+          this.updateSelectionFrame();
+        }
+      }
+      
+      onCellClick(row, col, ev) {
+        if (ev.shiftKey) {
+          const startRowFixed = Math.max(0, Math.min(this.ROWS - 4, row));
+          this.selection.startRow = startRowFixed;
+          this.selection.startCol = col;
+          this.selection.length = Math.max(4, this.selection.length);
+          this.updateSelectionFrame();
+          return;
+        }
+        
+        this.toggleCell(row, col);
+      }
+      
+      toggleCell(row, col) {
+        const idx = row * this.COLS + col;
+        this.grid[idx] = this.grid[idx] ? 0 : 1;
+        this.updateCell(row, col);
+      }
+      
+      updateCell(row, col) {
+        const idx = row * this.COLS + col;
+        const cell = document.querySelector(`.cell[data-row="${row}"][data-col="${col}"]`);
+        if (cell) {
+          cell.className = 'cell ' + (this.grid[idx] ? 'on' : 'off');
+        }
+      }
+      
+      updateSelectionFrame() {
+        const frame = document.getElementById('selectionFrame');
+        if (this.selection.active) {
+          frame.style.display = 'block';
+          frame.style.left = `${(this.selection.startCol / this.COLS) * 100}%`;
+          frame.style.top = `${(this.selection.startRow / this.ROWS) * 100}%`;
+          frame.style.width = `${(this.selection.length / this.COLS) * 100}%`;
+          frame.style.height = `${(4 / this.ROWS) * 100}%`;
+        } else {
+          frame.style.display = 'none';
+        }
+      }
+      
+      togglePlay() {
+        this.playing = !this.playing;
+        document.getElementById('playBtn').textContent = this.playing ? 'Stop' : 'Play';
+        
+        if (this.playing) {
+          this.nextStepTime = this.engine.audioCtx.currentTime + 0.05;
+          this.currentColIndex = 0;
+          this.currentStep = 0;
+          this.scheduler();
+        } else {
+          if (this.schedulerTimer) {
+            clearTimeout(this.schedulerTimer);
+            this.schedulerTimer = null;
+          }
+          this.clearPlayhead();
+        }
+      }
+      
+      scheduler() {
+        if (!this.playing) return;
+        
+        const scheduleAhead = 0.2;
+        const audioCtx = this.engine.audioCtx;
+        
+        while (this.nextStepTime < audioCtx.currentTime + scheduleAhead) {
+          this.scheduleStep(this.currentColIndex, this.nextStepTime);
+          this.nextStepTime += this.stepIntervalSec;
+          this.currentColIndex = (this.currentColIndex + 1) % this.selection.length;
+          this.currentStep = (this.currentStep + 1) % this.selection.length;
+        }
+        
+        this.schedulerTimer = setTimeout(() => this.scheduler(), 25);
+      }
+      
+      scheduleStep(colIndex, time) {
+        const { startRow, startCol } = this.selection;
+        const triggeredNow = [false, false, false, false];
+        
+        for (let r = 0; r < 4; r++) {
+          const row = startRow + r;
+          const col = startCol + colIndex;
+          if (row < 0 || row >= this.ROWS || col < 0 || col >= this.COLS) continue;
+          
+          const idx = row * this.COLS + col;
+          if (this.grid[idx]) {
+            this.engine.setMute(r, this.muted[r]);
+            this.engine.setVolume(r, this.volumes[r]);
+            this.engine.triggerRow(r, time, 127);
+            triggeredNow[r] = true;
+          }
+        }
+        
+        // Schedule visual feedback
+        const delay = Math.max(0, (time - this.engine.audioCtx.currentTime) * 1000);
+        setTimeout(() => {
+          this.updatePlayhead(colIndex);
+          this.flashTriggeredRows(triggeredNow);
+          document.getElementById('currentStep').textContent = colIndex;
+        }, delay);
+      }
+      
+      updatePlayhead(colIndex) {
+        // Clear previous playhead
+        document.querySelectorAll('.cell.playhead').forEach(cell => {
+          cell.classList.remove('playhead');
+        });
+        
+        // Add playhead to current column in selection
+        const { startRow, startCol } = this.selection;
+        const col = startCol + colIndex;
+        
+        for (let r = 0; r < 4; r++) {
+          const row = startRow + r;
+          if (row >= 0 && row < this.ROWS && col >= 0 && col < this.COLS) {
+            const cell = document.querySelector(`.cell[data-row="${row}"][data-col="${col}"]`);
+            if (cell) {
+              cell.classList.add('playhead');
+            }
+          }
+        }
+      }
+      
+      flashTriggeredRows(triggeredNow) {
+        for (let i = 0; i < 4; i++) {
+          const panel = document.getElementById(`voice${i}`);
+          const { startRow, startCol } = this.selection;
+          const row = startRow + i;
+          const col = startCol + this.currentColIndex;
+          
+          if (triggeredNow[i]) {
+            panel.classList.add('triggered');
+            
+            // Add triggered class to cell
+            if (row >= 0 && row < this.ROWS && col >= 0 && col < this.COLS) {
+              const cell = document.querySelector(`.cell[data-row="${row}"][data-col="${col}"]`);
+              if (cell) {
+                cell.classList.add('triggered');
+                setTimeout(() => {
+                  cell.classList.remove('triggered');
+                }, 100);
+              }
+            }
+          } else {
+            panel.classList.remove('triggered');
+          }
+        }
+        
+        // Clear triggered state
+        setTimeout(() => {
+          document.querySelectorAll('.voice-panel.triggered').forEach(p => {
+            p.classList.remove('triggered');
+          });
+        }, 100);
+      }
+      
+      clearPlayhead() {
+        document.querySelectorAll('.cell.playhead, .cell.triggered').forEach(cell => {
+          cell.classList.remove('playhead', 'triggered');
+        });
+      }
+      
+      randomize() {
+        const audioNow = this.engine.audioCtx.currentTime;
+        const next = Math.max(audioNow + 0.02, this.nextStepTime || audioNow + 0.05);
+        const ms = Math.max(0, (next - audioNow) * 1000);
+        
+        setTimeout(() => {
+          for (let i = 0; i < this.grid.length; i++) {
+            this.grid[i] = Math.random() > 0.6 ? 1 : 0;
+          }
+          this.renderGrid();
+        }, ms);
+      }
+      
+      renderGrid() {
+        for (let r = 0; r < this.ROWS; r++) {
+          for (let c = 0; c < this.COLS; c++) {
+            this.updateCell(r, c);
+          }
+        }
+      }
+    }
+
+    // Initialize the app when DOM is ready
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => {
+        new DrumSequencer();
+      });
+    } else {
+      new DrumSequencer();
+    }
+  </script>
+</body>
+</html>
