@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>64x64 Drum Sequencer — Demo</title>
+    <style>
+      body { margin: 0; padding: 0; background: rgb(0, 0, 255); color: white; font-family: 'Courier New', monospace; }
+      input, button, select { font: inherit; font-family: 'Courier New', monospace; }
+      /* make the file input a bit smaller when inside controls */
+      input[type=file] { font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <!-- React + ReactDOM (production builds) -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+
+    <!-- Babel for in-browser JSX transform (acceptable for demos only) -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- Load the demo JSX file (relative path) -->
+    <script type="text/babel">
+      // Load the file content via fetch so we can eval it and mount the default export.
+      (async function(){
+        const resp = await fetch('64_x_64_drum_sequencer_demo.jsx?v=' + Date.now());
+        let src = await resp.text();
+
+        // Remove top-level ES module import/export lines so the code can run in the page
+        // and replace `export default function SequencerDemo(...)` with a plain function.
+        src = src.replace(/import\s+[^;]+;\s*/g, '');
+        src = src.replace(/export\s+default\s+function\s+SequencerDemo\s*\(/, 'function SequencerDemo(');
+
+        // Inject hook bindings from global React so code using `useState/useEffect/useRef` works
+        const prelude = '\nconst { useState, useEffect, useRef, useMemo, useCallback } = React;\n';
+
+        const wrapped = prelude + src + '\n\nwindow.__SequencerDemo = SequencerDemo;';
+
+        // Transform with Babel (JSX -> JS), using the react preset.
+        const { code } = Babel.transform(wrapped, { presets: ['react'] });
+
+        // Evaluate the transformed code in the page context
+        // eslint-disable-next-line no-eval
+        eval(code);
+
+        const root = document.getElementById('root');
+        const ReactDOM = window.ReactDOM;
+        ReactDOM.createRoot(root).render(React.createElement(window.__SequencerDemo));
+      })().catch(err=>{
+        document.getElementById('root').innerText = 'Failed to load demo: ' + err;
+        console.error(err);
+      });
+    </script>
+  </body>
+</html>
